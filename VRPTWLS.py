@@ -81,11 +81,12 @@ class VRPTWInstance:
         self.distances = np.zeros((n, n))
         all_nodes = [self.depot] + self.customers
         for i in range(n):
-            for j in range(n):
-                if i != j:
-                    dx = all_nodes[i].x - all_nodes[j].x
-                    dy = all_nodes[i].y - all_nodes[j].y
-                    self.distances[i][j] = math.sqrt(dx * dx + dy * dy)
+            for j in range(i + 1, n):
+                dx = all_nodes[i].x - all_nodes[j].x
+                dy = all_nodes[i].y - all_nodes[j].y
+                dist = math.hypot(dx, dy)
+                self.distances[i][j] = dist
+                self.distances[j][i] = dist
 
     def classify_instance(self):
         basename = os.path.basename(self.filename).upper()
@@ -202,6 +203,13 @@ class HybridSolver:
             self.delta = 0.1
             self.lambda_param = 1.8
 
+        if instance.instance_type == 'C':
+            self.regret_weight = 0.15
+        elif instance.instance_type == 'R':
+            self.regret_weight = 0.35
+        else:
+            self.regret_weight = 0.25
+
     def solve(self) -> Solution:
         """Select by VEHICLES FIRST, then distance"""
         best_solution = None
@@ -273,6 +281,17 @@ class HybridSolver:
         assigned = np.zeros(len(self.instance.customers), dtype=bool)
 
         while not np.all(assigned):
+            insertion = self._get_best_global_insertion(solution, assigned)
+
+            if insertion:
+                route_idx, position, cust_id, _ = insertion
+                route = solution.routes[route_idx]
+                route.customers.insert(position, cust_id)
+                route.load += self.instance.get_customer(cust_id).demand
+                route.calculate_metrics()
+                assigned[cust_id - 1] = True
+                continue
+
             seed = self._get_seed(assigned, strategy)
             if seed == -1:
                 break
@@ -284,72 +303,17 @@ class HybridSolver:
             solution.routes.append(route)
             assigned[seed - 1] = True
 
-            while True:
-                best_customer, best_position, best_saving = self._get_best_insertion(
-                    solution.routes[-1], assigned
-                )
+        for route in solution.routes:
+            utilization = route.load / self.instance.vehicle_capacity if self.instance.vehicle_capacity else 0
+            customers_count = len(route.customers)
 
-                if best_customer == -1:
-                    route = solution.routes[-1]
-                    utilization = route.load / self.instance.vehicle_capacity
-                    customers_count = len(route.customers)
+            self.diagnostics['route_utilizations'].append(utilization)
+            self.diagnostics['customers_per_route'].append(customers_count)
 
-                    self.diagnostics['route_utilizations'].append(utilization)
-                    self.diagnostics['customers_per_route'].append(customers_count)
-
-                    if utilization < 0.6 and customers_count < 8:
-                        self.diagnostics['premature_closures'] += 1
-                    break
-
-                route = solution.routes[-1]
-                route.customers.insert(best_position, best_customer)
-                route.load += self.instance.get_customer(best_customer).demand
-                route.calculate_metrics()
-                assigned[best_customer - 1] = True
+            if utilization < 0.6 and customers_count < 8:
+                self.diagnostics['premature_closures'] += 1
 
         return solution
-
-    def _get_best_insertion(self, route: Route, assigned: np.ndarray) -> Tuple[int, int, float]:
-        """Find customer with maximum savings"""
-        best_customer = -1
-        best_position = -1
-        max_saving = -float('inf')
-
-        for cust_id in range(1, len(self.instance.customers) + 1):
-            if assigned[cust_id - 1]:
-                continue
-
-            customer = self.instance.get_customer(cust_id)
-
-            if route.load + customer.demand > self.instance.vehicle_capacity:
-                continue
-
-            min_cost = float('inf')
-            best_pos = -1
-
-            for pos in range(len(route.customers) + 1):
-                cost = self._calculate_insertion_cost(route, cust_id, pos)
-
-                if cost < min_cost:
-                    min_cost = cost
-                    best_pos = pos
-
-            if best_pos == -1:
-                continue
-
-            depot_distance = self.lambda_param * self.instance.distances[0][cust_id]
-            saving = depot_distance - min_cost
-
-            route_utilization = route.load / self.instance.vehicle_capacity
-            if route_utilization < 0.5 and saving > -20:
-                saving = max(saving, 0)
-
-            if saving > max_saving:
-                max_saving = saving
-                best_customer = cust_id
-                best_position = best_pos
-
-        return best_customer, best_position, max_saving
 
     def _calculate_insertion_cost(self, route: Route, cust_id: int, position: int) -> float:
         """4-component insertion cost"""
@@ -419,6 +383,69 @@ class HybridSolver:
             C_compactness = self.delta * dist_to_center
 
         return C_dist + C_wait + C_time_delay_cost + C_compactness
+
+    def _get_best_global_insertion(self, solution: Solution, assigned: np.ndarray):
+        """Find the best insertion across all existing routes using regret-aware savings"""
+
+        if not solution.routes:
+            return None
+
+        best_candidate = None
+        best_priority = -float('inf')
+        capacity = self.instance.vehicle_capacity
+
+        for cust_id in range(1, len(self.instance.customers) + 1):
+            if assigned[cust_id - 1]:
+                continue
+
+            customer = self.instance.get_customer(cust_id)
+
+            if customer.demand > capacity:
+                continue
+
+            best_cost = float('inf')
+            second_cost = float('inf')
+            best_route_idx = -1
+            best_position = -1
+
+            for idx, route in enumerate(solution.routes):
+                if route.load + customer.demand > capacity:
+                    continue
+
+                for pos in range(len(route.customers) + 1):
+                    cost = self._calculate_insertion_cost(route, cust_id, pos)
+                    if cost == float('inf'):
+                        continue
+
+                    if cost < best_cost:
+                        second_cost = best_cost
+                        best_cost = cost
+                        best_route_idx = idx
+                        best_position = pos
+                    elif cost < second_cost:
+                        second_cost = cost
+
+            if best_route_idx == -1:
+                continue
+
+            depot_distance = self.lambda_param * self.instance.distances[0][cust_id]
+            saving = depot_distance - best_cost
+
+            regret = 0.0
+            if second_cost < float('inf'):
+                regret = max(0.0, second_cost - best_cost)
+
+            route = solution.routes[best_route_idx]
+            utilization = route.load / capacity if capacity else 0.0
+            utilization_bias = (1.0 - utilization) * 0.05 * depot_distance
+
+            priority = saving + self.regret_weight * regret + utilization_bias
+
+            if priority > best_priority:
+                best_priority = priority
+                best_candidate = (best_route_idx, best_position, cust_id, priority)
+
+        return best_candidate
 
     def _get_seed(self, assigned: np.ndarray, strategy: int) -> int:
         """8 diverse seed strategies"""
